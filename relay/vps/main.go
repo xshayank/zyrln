@@ -15,6 +15,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 const maxBodyBytes = 32 * 1024 * 1024
@@ -40,24 +42,69 @@ func main() {
 	timeout := flag.Duration("timeout", 45*time.Second, "target request timeout")
 	flag.Parse()
 
+	proxyAddr := strings.TrimSpace(os.Getenv("SOCKS5_PROXY"))
+
+	baseDialer := &net.Dialer{
+		Timeout:   15 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	if proxyAddr != "" {
+		var auth *proxy.Auth
+
+		// supports:
+		// 127.0.0.1:1080
+		// user:pass@127.0.0.1:1080
+		if strings.Contains(proxyAddr, "@") {
+			parts := strings.SplitN(proxyAddr, "@", 2)
+
+			creds := parts[0]
+			proxyAddr = parts[1]
+
+			cp := strings.SplitN(creds, ":", 2)
+			if len(cp) == 2 {
+				auth = &proxy.Auth{
+					User:     cp[0],
+					Password: cp[1],
+				}
+			}
+		}
+
+		socksDialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, baseDialer)
+		if err != nil {
+			log.Fatalf("failed to create SOCKS5 proxy: %v", err)
+		}
+
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return socksDialer.Dial(network, addr)
+		}
+
+		log.Printf("using SOCKS5 proxy: %s", proxyAddr)
+	} else {
+		transport.DialContext = baseDialer.DialContext
+	}
+
 	client := &http.Client{
-		Timeout: *timeout,
-		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          256,
-			MaxIdleConnsPerHost:   64,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   15 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
+		Timeout:  *timeout,
+		Transport: transport,
 	}
 
 	mux := http.NewServeMux()
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
+
 	mux.HandleFunc("/relay", func(w http.ResponseWriter, r *http.Request) {
 		handleRelay(w, r, client, *key, *timeout)
 	})
@@ -69,9 +116,11 @@ func main() {
 	}
 
 	log.Printf("zyrln relay listening on http://%s", *listen)
+
 	if *key == "" {
 		log.Printf("warning: ZYRLN_RELAY_KEY is empty; /relay is not protected")
 	}
+
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
@@ -79,28 +128,42 @@ func main() {
 
 func handleRelay(w http.ResponseWriter, r *http.Request, client *http.Client, key string, timeout time.Duration) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, relayResponse{Error: "POST required"})
+		writeJSON(w, http.StatusMethodNotAllowed, relayResponse{
+			Error: "POST required",
+		})
 		return
 	}
+
 	if key != "" && r.Header.Get("X-Relay-Key") != key {
-		writeJSON(w, http.StatusUnauthorized, relayResponse{Error: "unauthorized"})
+		writeJSON(w, http.StatusUnauthorized, relayResponse{
+			Error: "unauthorized",
+		})
 		return
 	}
 
 	var req relayRequest
+
 	decoder := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes))
+
 	if err := decoder.Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, relayResponse{Error: "bad json: " + err.Error()})
+		writeJSON(w, http.StatusBadRequest, relayResponse{
+			Error: "bad json: " + err.Error(),
+		})
 		return
 	}
 
 	target, err := url.Parse(req.URL)
 	if err != nil || target.Scheme == "" || target.Host == "" {
-		writeJSON(w, http.StatusBadRequest, relayResponse{Error: "bad url"})
+		writeJSON(w, http.StatusBadRequest, relayResponse{
+			Error: "bad url",
+		})
 		return
 	}
+
 	if target.Scheme != "http" && target.Scheme != "https" {
-		writeJSON(w, http.StatusBadRequest, relayResponse{Error: "unsupported scheme"})
+		writeJSON(w, http.StatusBadRequest, relayResponse{
+			Error: "unsupported scheme",
+		})
 		return
 	}
 
@@ -110,10 +173,13 @@ func handleRelay(w http.ResponseWriter, r *http.Request, client *http.Client, ke
 	}
 
 	var body []byte
+
 	if req.Body != "" {
 		body, err = base64.StdEncoding.DecodeString(req.Body)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, relayResponse{Error: "bad base64 body"})
+			writeJSON(w, http.StatusBadRequest, relayResponse{
+				Error: "bad base64 body",
+			})
 			return
 		}
 	}
@@ -121,11 +187,20 @@ func handleRelay(w http.ResponseWriter, r *http.Request, client *http.Client, ke
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	outReq, err := http.NewRequestWithContext(ctx, method, target.String(), bytes.NewReader(body))
+	outReq, err := http.NewRequestWithContext(
+		ctx,
+		method,
+		target.String(),
+		bytes.NewReader(body),
+	)
+
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, relayResponse{Error: err.Error()})
+		writeJSON(w, http.StatusBadRequest, relayResponse{
+			Error: err.Error(),
+		})
 		return
 	}
+
 	for hk, hv := range req.Headers {
 		if !skipForwardedHeader(hk) {
 			outReq.Header.Set(hk, hv)
@@ -133,6 +208,7 @@ func handleRelay(w http.ResponseWriter, r *http.Request, client *http.Client, ke
 	}
 
 	localClient := *client
+
 	if !req.Redirect {
 		localClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -140,22 +216,32 @@ func handleRelay(w http.ResponseWriter, r *http.Request, client *http.Client, ke
 	}
 
 	start := time.Now()
+
 	resp, err := localClient.Do(outReq)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, relayResponse{Error: err.Error()})
+		writeJSON(w, http.StatusBadGateway, relayResponse{
+			Error: err.Error(),
+		})
+
 		log.Printf("%s %s -> error %s", method, target.String(), err)
+
 		return
 	}
+
 	defer resp.Body.Close()
 
 	limited := io.LimitReader(resp.Body, maxBodyBytes)
+
 	respBody, err := io.ReadAll(limited)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, relayResponse{Error: "read response: " + err.Error()})
+		writeJSON(w, http.StatusBadGateway, relayResponse{
+			Error: "read response: " + err.Error(),
+		})
 		return
 	}
 
 	headers := map[string][]string{}
+
 	for hk, values := range resp.Header {
 		headers[strings.ToLower(hk)] = values
 	}
@@ -165,13 +251,28 @@ func handleRelay(w http.ResponseWriter, r *http.Request, client *http.Client, ke
 		Headers: headers,
 		Body:    base64.StdEncoding.EncodeToString(respBody),
 	})
-	log.Printf("%s %s -> %d %dB %s", method, target.String(), resp.StatusCode, len(respBody), time.Since(start).Round(time.Millisecond))
+
+	log.Printf(
+		"%s %s -> %d %dB %s",
+		method,
+		target.String(),
+		resp.StatusCode,
+		len(respBody),
+		time.Since(start).Round(time.Millisecond),
+	)
 }
 
 func skipForwardedHeader(key string) bool {
 	switch strings.ToLower(key) {
-	case "host", "connection", "content-length", "proxy-connection", "proxy-authorization", "transfer-encoding", "accept-encoding":
+	case "host",
+		"connection",
+		"content-length",
+		"proxy-connection",
+		"proxy-authorization",
+		"transfer-encoding",
+		"accept-encoding":
 		return true
+
 	default:
 		return false
 	}
@@ -179,7 +280,9 @@ func skipForwardedHeader(key string) bool {
 
 func writeJSON(w http.ResponseWriter, status int, resp relayResponse) {
 	w.Header().Set("Content-Type", "application/json")
+
 	w.WriteHeader(status)
+
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		fmt.Fprintf(w, `{"e":%q}`, err.Error())
 	}
@@ -189,5 +292,6 @@ func envDefault(key, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
 	}
+
 	return fallback
 }
