@@ -303,6 +303,19 @@ func handleMITMTLS(tlsConn net.Conn, certHost, targetHost string, coal *Coalesce
 			return
 		}
 
+		// WebSocket upgrades require a persistent bidirectional connection which
+		// GAS cannot provide natively. Route them through the VPS relay's
+		// WebSocket session manager instead.
+		if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+			_ = req.Body.Close()
+			if coal == nil {
+				_, _ = tlsConn.Write([]byte("HTTP/1.1 502 Relay not configured\r\nConnection: close\r\n\r\n"))
+				return
+			}
+			handleWebSocketViaRelay(tlsConn, reader, req, certHost, targetHost, coal)
+			return
+		}
+
 		body, err := io.ReadAll(io.LimitReader(req.Body, 8*1024*1024))
 		_ = req.Body.Close()
 		if err != nil {
