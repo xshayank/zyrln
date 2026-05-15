@@ -109,6 +109,10 @@ func main() {
 		handleRelay(w, r, client, *key, *timeout)
 	})
 
+	mux.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
+		handleTunnel(w, r, baseDialer, *key)
+	})
+
 	server := &http.Server{
 		Addr:              *listen,
 		Handler:           mux,
@@ -260,6 +264,73 @@ func handleRelay(w http.ResponseWriter, r *http.Request, client *http.Client, ke
 		len(respBody),
 		time.Since(start).Round(time.Millisecond),
 	)
+}
+
+// handleTunnel accepts a GET request with an Upgrade: tcp-tunnel header and
+// X-Tunnel-Host: host:port header, dials the target via TCP, then hijacks the
+// HTTP connection and pipes both sides bidirectionally. This allows clients to
+// tunnel arbitrary TCP streams (e.g. WebSocket) through the VPS relay.
+func handleTunnel(w http.ResponseWriter, r *http.Request, dialer *net.Dialer, key string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+	if key != "" && r.Header.Get("X-Relay-Key") != key {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	targetHost := strings.TrimSpace(r.Header.Get("X-Tunnel-Host"))
+	if targetHost == "" {
+		http.Error(w, "missing X-Tunnel-Host", http.StatusBadRequest)
+		return
+	}
+	// basic validation: must look like host:port
+	if _, _, err := net.SplitHostPort(targetHost); err != nil {
+		http.Error(w, "invalid X-Tunnel-Host: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	targetConn, err := dialer.DialContext(r.Context(), "tcp", targetHost)
+	if err != nil {
+		http.Error(w, "dial failed: "+err.Error(), http.StatusBadGateway)
+		log.Printf("tunnel dial %s -> error %s", targetHost, err)
+		return
+	}
+	defer targetConn.Close()
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		targetConn.Close()
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		targetConn.Close()
+		return
+	}
+	defer clientConn.Close()
+
+	_, _ = clientConn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: tcp-tunnel\r\nConnection: Upgrade\r\n\r\n"))
+
+	log.Printf("tunnel %s established", targetHost)
+	pipeTunnel(clientConn, targetConn)
+}
+
+func pipeTunnel(a, b net.Conn) {
+	done := make(chan struct{}, 2)
+	cp := func(dst, src net.Conn) {
+		_, _ = io.Copy(dst, src)
+		_ = dst.SetDeadline(time.Now())
+		_ = src.SetDeadline(time.Now())
+		done <- struct{}{}
+	}
+	go cp(b, a)
+	go cp(a, b)
+	<-done
+	<-done
 }
 
 func skipForwardedHeader(key string) bool {
