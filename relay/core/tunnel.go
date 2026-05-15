@@ -199,7 +199,9 @@ func handleWebSocketViaRelay(clientConn net.Conn, clientReader *bufio.Reader,
 	go func() {
 		defer func() {
 			close(done)
-			clientConn.SetDeadline(time.Now()) // unblock writer's read
+			// Setting a past deadline unblocks any in-progress read in the
+			// writer goroutine, causing it to exit cleanly.
+			_ = clientConn.SetDeadline(time.Now())
 		}()
 		wsProxyReader(clientConn, coal, sessionID)
 		// Best-effort WS close frame to the browser

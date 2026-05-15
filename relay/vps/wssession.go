@@ -238,10 +238,12 @@ func sessionCleanupLoop() {
 	}
 }
 
-func newSessionID() string {
+func newSessionID() (string, error) {
 	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate session id: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // ── Operation router ──────────────────────────────────────────────────────────
@@ -387,7 +389,12 @@ func handleWSConnect(w http.ResponseWriter, body []byte, timeout time.Duration) 
 		return
 	}
 
-	sessID := newSessionID()
+	sessID, err := newSessionID()
+	if err != nil {
+		_ = conn.Close()
+		writeJSON(w, http.StatusInternalServerError, relayResponse{Error: "session id: " + err.Error()})
+		return
+	}
 	sess := &wsSession{
 		conn:     conn,
 		reader:   reader,
@@ -525,7 +532,9 @@ func handleWSSend(w http.ResponseWriter, body []byte) {
 	for _, f := range req.Frames {
 		payload, err := base64.StdEncoding.DecodeString(f.Payload)
 		if err != nil {
-			continue
+			result, _ := json.Marshal(sendResp{OK: false, Error: fmt.Sprintf("frame base64 decode: %v", err)})
+			writeRelayBody(w, result)
+			return
 		}
 		if err := vpsWriteWSFrame(sess.conn, f.Opcode, payload); err != nil {
 			result, _ := json.Marshal(sendResp{OK: false, Error: "write: " + err.Error()})
