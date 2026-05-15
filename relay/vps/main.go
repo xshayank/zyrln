@@ -89,9 +89,14 @@ func main() {
 			return socksDialer.Dial(network, addr)
 		}
 
+		wsDialCtx = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return socksDialer.Dial(network, addr)
+		}
+
 		log.Printf("using SOCKS5 proxy: %s", proxyAddr)
 	} else {
 		transport.DialContext = baseDialer.DialContext
+		wsDialCtx = baseDialer.DialContext
 	}
 
 	client := &http.Client{
@@ -164,6 +169,14 @@ func handleRelay(w http.ResponseWriter, r *http.Request, client *http.Client, ke
 		writeJSON(w, http.StatusBadRequest, relayResponse{
 			Error: "unsupported scheme",
 		})
+		return
+	}
+
+	// Internal WebSocket session operations are signalled by using the reserved
+	// host ws.zyrln.internal. Route them to the session manager instead of
+	// making an outbound HTTP request.
+	if target.Host == wsInternalHost {
+		handleWSOperation(w, &req, timeout)
 		return
 	}
 

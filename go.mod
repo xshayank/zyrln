@@ -2,7 +2,10 @@ module zyrln
 
 go 1.25.0
 
-require golang.org/x/mobile v0.0.0-20260410095206-2cfb76559b7b
+require (
+	golang.org/x/mobile v0.0.0-20260410095206-2cfb76559b7b
+	golang.org/x/net v0.53.0
+)
 
 require (
 	golang.org/x/mod v0.35.0 // indirect
